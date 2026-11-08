@@ -35,7 +35,7 @@ export default function LoginPage() {
           <Logo />
         </div>
         <Card className="p-6">
-          <h1 className="font-display text-3xl">Photographer login</h1>
+          <h1 className="font-display text-3xl">Admin login</h1>
           <p className="text-sm text-muted mt-1 mb-6">Manage your events and uploads.</p>
           <form onSubmit={submit} className="space-y-4">
             <Field label="Password">
