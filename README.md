@@ -48,9 +48,14 @@ or WebP photo.
 
 ## Storage
 
-Events, photos and face descriptors are stored on disk in `./data` (see `src/lib/db.ts`).
-That's fine for local use and a single server. For serverless hosting (e.g. Vercel) swap
-`src/lib/db.ts` for a database + object storage (Postgres + Blob, Supabase, S3…).
+Event and photo records (including face descriptors) are stored in Supabase Postgres
+(see `src/lib/db.ts`); the images themselves stay in Google Drive.
+
+1. Create a Supabase project and run `supabase/schema.sql` in its SQL Editor.
+2. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `.env.local` (and in your host's
+   environment variables, e.g. Vercel).
+3. To copy data from the old local store in `./data`, run
+   `node --env-file=.env.local scripts/migrate-to-supabase.mjs` (safe to re-run).
 
 ## Differences from pixel-match
 

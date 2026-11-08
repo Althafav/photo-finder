@@ -1,12 +1,9 @@
 import 'server-only';
-import { promises as fs } from 'fs';
-import path from 'path';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-// Local JSON + filesystem store. Swap this module for a real database /
-// object storage (Supabase, Postgres + Blob, …) when deploying.
-
-export const DATA_DIR = path.join(process.cwd(), 'data');
-const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
+// Event and photo records live in Supabase Postgres (tables in supabase/schema.sql).
+// Images themselves stay in Google Drive. This module runs only on the server and
+// uses the service-role key, so the tables can stay locked to the public.
 
 export type EventRecord = {
   id: string;
@@ -43,120 +40,209 @@ export type PhotoRecord = {
   createdAt: string;
 };
 
-// Serialize all writes so parallel uploads never clobber each other.
-let queue: Promise<unknown> = Promise.resolve();
-function locked<T>(fn: () => Promise<T>): Promise<T> {
-  const run = queue.then(fn, fn);
-  queue = run.catch(() => {});
-  return run;
-}
+// ---- Client ---------------------------------------------------------------
 
-async function readJson<T>(file: string, fallback: T): Promise<T> {
-  try {
-    return JSON.parse(await fs.readFile(file, 'utf8')) as T;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return fallback;
-    throw err;
+let client: SupabaseClient | undefined;
+
+function db() {
+  if (!client) {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!url || !key) throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set');
+    client = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
   }
+  return client;
 }
 
-async function writeJson(file: string, data: unknown) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(data));
-  // On Windows the target can be briefly locked (OneDrive sync, antivirus,
-  // another reader), making rename fail with EPERM/EBUSY — retry a few times.
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await fs.rename(tmp, file);
-      return;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (attempt >= 8 || !['EPERM', 'EBUSY', 'EACCES'].includes(code ?? '')) {
-        await fs.rm(tmp, { force: true });
-        throw err;
-      }
-      await new Promise((r) => setTimeout(r, 50 * 2 ** Math.min(attempt, 4)));
-    }
+/** Throw Supabase errors so routes fail loudly instead of acting on missing data. */
+function check<T>({ data, error }: { data: T; error: { message: string } | null }): T {
+  if (error) throw new Error(`Supabase: ${error.message}`);
+  return data;
+}
+
+// ---- Row mapping (snake_case columns ↔ camelCase records) -----------------
+
+type EventRow = {
+  id: string;
+  slug: string;
+  name: string;
+  date: string | null;
+  password_hash: string | null;
+  expires_at: string | null;
+  drive_folder_id: string | null;
+  created_at: string;
+};
+
+type PhotoRow = {
+  id: string;
+  event_id: string;
+  file_name: string;
+  ext: string;
+  mime: string;
+  size: number;
+  width: number;
+  height: number;
+  faces: number[][];
+  boxes: number[][] | null;
+  drive_file_id: string | null;
+  has_original: boolean | null;
+  created_at: string;
+};
+
+// Postgres returns timestamps as "2026-11-08 10:00:00+00"; keep the ISO format the app has always used.
+const iso = (value: string) => new Date(value).toISOString();
+const opt = <T>(value: T | null) => value ?? undefined;
+
+function toEvent(row: EventRow): EventRecord {
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    date: opt(row.date),
+    passwordHash: opt(row.password_hash),
+    expiresAt: row.expires_at ? iso(row.expires_at) : undefined,
+    driveFolderId: opt(row.drive_folder_id),
+    createdAt: iso(row.created_at),
+  };
+}
+
+// Field → column for event writes. `undefined` becomes null, which is how a field is cleared.
+const EVENT_COLUMNS: Record<keyof EventRecord, keyof EventRow> = {
+  id: 'id',
+  slug: 'slug',
+  name: 'name',
+  date: 'date',
+  passwordHash: 'password_hash',
+  expiresAt: 'expires_at',
+  driveFolderId: 'drive_folder_id',
+  createdAt: 'created_at',
+};
+
+function eventToRow(event: Partial<EventRecord>) {
+  const row: Record<string, unknown> = {};
+  for (const key of Object.keys(event) as (keyof EventRecord)[]) {
+    row[EVENT_COLUMNS[key]] = event[key] ?? null;
   }
+  return row;
 }
 
-export const eventDir = (eventId: string) => path.join(DATA_DIR, 'events', eventId);
-const photosFile = (eventId: string) => path.join(eventDir(eventId), 'photos.json');
+function toPhoto(row: PhotoRow): PhotoRecord {
+  return {
+    id: row.id,
+    eventId: row.event_id,
+    fileName: row.file_name,
+    ext: row.ext,
+    mime: row.mime,
+    size: row.size,
+    width: row.width,
+    height: row.height,
+    faces: row.faces,
+    boxes: opt(row.boxes),
+    driveFileId: opt(row.drive_file_id),
+    hasOriginal: opt(row.has_original),
+    createdAt: iso(row.created_at),
+  };
+}
+
+function photoToRow(photo: PhotoRecord): PhotoRow {
+  return {
+    id: photo.id,
+    event_id: photo.eventId,
+    file_name: photo.fileName,
+    ext: photo.ext,
+    mime: photo.mime,
+    size: photo.size,
+    width: photo.width,
+    height: photo.height,
+    faces: photo.faces,
+    boxes: photo.boxes ?? null,
+    drive_file_id: photo.driveFileId ?? null,
+    has_original: photo.hasOriginal ?? null,
+    created_at: photo.createdAt,
+  };
+}
+
+// ---- Events ---------------------------------------------------------------
 
 export async function listEvents() {
-  const events = await readJson<EventRecord[]>(EVENTS_FILE, []);
-  return events.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const rows = check(await db().from('events').select('*').order('created_at', { ascending: false }));
+  return (rows as EventRow[]).map(toEvent);
 }
 
 export async function getEvent(id: string) {
-  return (await listEvents()).find((e) => e.id === id) ?? null;
+  const row = check(await db().from('events').select('*').eq('id', id).maybeSingle());
+  return row ? toEvent(row as EventRow) : null;
 }
 
 export async function getEventBySlug(slug: string) {
-  return (await listEvents()).find((e) => e.slug === slug) ?? null;
+  const row = check(await db().from('events').select('*').eq('slug', slug).maybeSingle());
+  return row ? toEvent(row as EventRow) : null;
 }
 
-export function createEvent(event: EventRecord) {
-  return locked(async () => {
-    const events = await readJson<EventRecord[]>(EVENTS_FILE, []);
-    events.push(event);
-    await writeJson(EVENTS_FILE, events);
-    return event;
-  });
+export async function createEvent(event: EventRecord) {
+  const row = check(await db().from('events').insert(eventToRow(event)).select().single());
+  return toEvent(row as EventRow);
 }
 
-export function updateEvent(id: string, patch: Partial<EventRecord>) {
-  return locked(async () => {
-    const events = await readJson<EventRecord[]>(EVENTS_FILE, []);
-    const idx = events.findIndex((e) => e.id === id);
-    if (idx === -1) return null;
-    events[idx] = { ...events[idx], ...patch, id };
-    // Allow clearing optional fields by passing undefined.
-    for (const key of Object.keys(patch) as (keyof EventRecord)[]) {
-      if (patch[key] === undefined) delete events[idx][key];
-    }
-    await writeJson(EVENTS_FILE, events);
-    return events[idx];
-  });
+/** Pass a field as `undefined` to clear it. */
+export async function updateEvent(id: string, patch: Partial<EventRecord>) {
+  const changes = eventToRow(patch);
+  delete changes.id; // An event's id never changes.
+  const row = check(await db().from('events').update(changes).eq('id', id).select().maybeSingle());
+  return row ? toEvent(row as EventRow) : null;
 }
 
-export function deleteEvent(id: string) {
-  return locked(async () => {
-    const events = await readJson<EventRecord[]>(EVENTS_FILE, []);
-    await writeJson(EVENTS_FILE, events.filter((e) => e.id !== id));
-    await fs.rm(eventDir(id), { recursive: true, force: true });
-  });
+/** Deleting an event also deletes its photos (ON DELETE CASCADE). */
+export async function deleteEvent(id: string) {
+  check(await db().from('events').delete().eq('id', id));
 }
+
+// ---- Photos ---------------------------------------------------------------
+
+// Supabase returns at most 1,000 rows per request, so read big events page by page.
+const PAGE = 1000;
 
 export async function listPhotos(eventId: string) {
-  return readJson<PhotoRecord[]>(photosFile(eventId), []);
+  const photos: PhotoRecord[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const rows = check(
+      await db()
+        .from('photos')
+        .select('*')
+        .eq('event_id', eventId)
+        .order('created_at')
+        .order('id')
+        .range(from, from + PAGE - 1),
+    ) as PhotoRow[];
+    photos.push(...rows.map(toPhoto));
+    if (rows.length < PAGE) return photos;
+  }
 }
 
 export async function getPhoto(eventId: string, photoId: string) {
-  return (await listPhotos(eventId)).find((p) => p.id === photoId) ?? null;
+  const row = check(
+    await db().from('photos').select('*').eq('event_id', eventId).eq('id', photoId).maybeSingle(),
+  );
+  return row ? toPhoto(row as PhotoRow) : null;
 }
 
-export function addPhoto(photo: PhotoRecord) {
-  return locked(async () => {
-    const photos = await listPhotos(photo.eventId);
-    photos.push(photo);
-    await writeJson(photosFile(photo.eventId), photos);
-    return photo;
-  });
+export async function addPhoto(photo: PhotoRecord) {
+  check(await db().from('photos').insert(photoToRow(photo)));
+  return photo;
 }
 
 /** Replace a photo's faces (and their positions) after a re-scan. */
-export function updatePhotoFaces(eventId: string, photoId: string, faces: number[][], boxes: number[][]) {
-  return locked(async () => {
-    const photos = await listPhotos(eventId);
-    const photo = photos.find((p) => p.id === photoId);
-    if (!photo) return null;
-    photo.faces = faces;
-    photo.boxes = boxes;
-    await writeJson(photosFile(eventId), photos);
-    return photo;
-  });
+export async function updatePhotoFaces(eventId: string, photoId: string, faces: number[][], boxes: number[][]) {
+  const row = check(
+    await db()
+      .from('photos')
+      .update({ faces, boxes })
+      .eq('event_id', eventId)
+      .eq('id', photoId)
+      .select()
+      .maybeSingle(),
+  );
+  return row ? toPhoto(row as PhotoRow) : null;
 }
 
 export function isExpired(event: EventRecord) {
