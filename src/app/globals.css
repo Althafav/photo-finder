@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f6f3ee;
+  --surface: #ffffff;
+  --surface-2: #efe9e1;
+  --line: #e2dad0;
+  --fg: #1c1915;
+  --muted: #7a7066;
+  --accent: #c2410c;
+  --accent-fg: #ffffff;
+  --danger: #b91c1c;
+  --ok: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f0d0b;
+    --surface: #181512;
+    --surface-2: #221e1a;
+    --line: #2e2823;
+    --fg: #f2ece4;
+    --muted: #9b9086;
+    --accent: #f97316;
+    --accent-fg: #160b03;
+    --danger: #f87171;
+    --ok: #4ade80;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+  --font-sans: var(--font-geist-sans);
+  --font-display: var(--font-instrument-serif);
+  /* Guest selfie: a band sweeping over the photo while it's scanned for a face. */
+  --animate-scan: scan 1.8s ease-in-out infinite alternate;
+}
+
+/* transform (not top) so it keeps moving while face detection blocks the main thread. */
+@keyframes scan {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(100%);
+  }
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
